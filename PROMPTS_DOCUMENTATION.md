@@ -252,3 +252,174 @@ if !request.validate_system_prompt() {
 5. DeepSeek reasoning is extracted
 6. Messages + reasoning are passed to Anthropic API (Line 250 or 470)
 
+---
+
+## API Request Structure
+
+### Complete Request Format
+
+**Purpose:** Defines the complete structure for API requests to the DeepClaude backend, including all configurable parameters.
+
+**Location:** `README.md:178`, `src/models/request.rs:14-29`
+
+**Request Schema:**
+```json
+{
+    "system": "Optional system prompt string",
+    "messages": [
+        {
+            "role": "user",
+            "content": "User message content"
+        },
+        {
+            "role": "assistant",
+            "content": "Assistant response content"
+        }
+    ],
+    "stream": false,
+    "verbose": false,
+    "deepseek_config": {
+        "headers": {
+            "Custom-Header": "value"
+        },
+        "body": {
+            "temperature": 1.0,
+            "max_tokens": 8192
+        }
+    },
+    "anthropic_config": {
+        "headers": {
+            "Custom-Header": "value"
+        },
+        "body": {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 8192,
+            "temperature": 1.0
+        }
+    }
+}
+```
+
+**Field Descriptions:**
+
+**`system` (Optional String):**
+- Default system prompt for the conversation
+- Applied to both DeepSeek and Claude models
+- Cannot be provided if a system message exists in the messages array
+- If omitted, models use their default behavior
+
+**`messages` (Required Array):**
+- Array of conversation messages
+- Each message has `role` ("system", "user", or "assistant") and `content` fields
+- Maintains conversation history and context
+- System messages in this array are filtered and repositioned to the beginning
+
+**`stream` (Optional Boolean, Default: false):**
+- Controls whether responses are streamed or returned as a single block
+- When `true`, uses Server-Sent Events (SSE) for streaming
+- When `false`, waits for complete response before returning
+
+**`verbose` (Optional Boolean, Default: false):**
+- Controls whether DeepSeek's reasoning (thinking) is included in the response
+- When `true`, returns both thinking and final response
+- When `false`, only returns final Claude response
+
+**`deepseek_config` (Optional Object):**
+- Custom configuration for DeepSeek API calls
+- `headers`: Custom HTTP headers for DeepSeek requests
+- `body`: Override default DeepSeek parameters (temperature, max_tokens, etc.)
+- Merged with default configuration
+
+**`anthropic_config` (Optional Object):**
+- Custom configuration for Anthropic Claude API calls
+- `headers`: Custom HTTP headers for Anthropic requests
+- `body`: Override default Claude parameters (model, temperature, max_tokens, etc.)
+- Merged with default configuration
+
+---
+
+### Request Data Structure (Rust)
+
+**Purpose:** Defines the Rust data structures for parsing and validating API requests.
+
+**Location:** `src/models/request.rs`
+
+**ApiRequest Structure:**
+```rust
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApiRequest {
+    #[serde(default)]
+    pub stream: bool,
+
+    #[serde(default)]
+    pub verbose: bool,
+
+    pub system: Option<String>,
+    pub messages: Vec<Message>,
+
+    #[serde(default)]
+    pub deepseek_config: ApiConfig,
+
+    #[serde(default)]
+    pub anthropic_config: ApiConfig,
+}
+```
+
+**Message Structure:**
+```rust
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Message {
+    pub role: Role,
+    pub content: String,
+}
+```
+
+**Role Enum:**
+```rust
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+```
+
+**ApiConfig Structure:**
+```rust
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ApiConfig {
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+
+    #[serde(default)]
+    pub body: serde_json::Value,
+}
+```
+
+---
+
+## Summary
+
+### Prompt Categories
+
+1. **System Prompts:** User-configurable instructions that define AI behavior
+2. **Configuration Prompts:** Default parameters that control model behavior
+3. **Validation Logic:** Rules ensuring prompts are correctly structured
+4. **Request Structure:** Format for submitting prompts and messages to the API
+
+### Key Principles
+
+1. **Flexibility:** System prompts are optional and user-customizable
+2. **Consistency:** Same system prompt applied to both DeepSeek and Claude for coherent responses
+3. **Validation:** Strict validation prevents duplicate or malformed prompts
+4. **Configuration:** Separate configuration for each model allows fine-tuned control
+5. **Positioning:** System prompts always come first, regardless of input format
+
+### Prompt Flow
+
+```
+User Input → Validation → System Prompt Positioning → DeepSeek Processing →
+Reasoning Extraction → Claude Processing → Final Response
+```
+
