@@ -127,3 +127,128 @@ match model_name {
 - **Haiku models:** Fastest responses for simple tasks
 - **Opus models:** Highest intelligence for complex reasoning tasks
 
+---
+
+## Prompt Validation and Processing
+
+### System Prompt Validation
+
+**Purpose:** Ensures that system prompts are not duplicated in both the root level and messages array, which would cause API errors.
+
+**Location:** `src/models/request.rs:75-80`
+
+**Validation Logic:**
+```rust
+pub fn validate_system_prompt(&self) -> bool {
+    let system_in_messages = self.messages.iter().any(|msg| matches!(msg.role, Role::System));
+
+    // Only invalid if system prompt is provided in both places
+    !(self.system.is_some() && system_in_messages)
+}
+```
+
+**Validation Rules:**
+1. System prompt can be provided at root level (`system` field)
+2. System prompt can be provided in messages array (message with `role: "system"`)
+3. System prompt cannot be provided in both places simultaneously
+4. System prompt is optional - can be omitted entirely
+
+**Error Handling:** If validation fails, the API returns a `BAD_REQUEST` error with the message: "System prompt cannot be provided in both root and messages"
+
+---
+
+### System Prompt Positioning
+
+**Purpose:** Ensures the system prompt is always the first message in the conversation, regardless of where it was provided in the request.
+
+**Location:** `src/models/request.rs:90-105`
+
+**Positioning Logic:**
+```rust
+pub fn get_messages_with_system(&self) -> Vec<Message> {
+    let mut messages = Vec::new();
+
+    // Add system message first
+    if let Some(system) = &self.system {
+        messages.push(Message {
+            role: Role::System,
+            content: system.clone(),
+        });
+    }
+
+    // Add remaining messages
+    messages.extend(
+        self.messages
+            .iter()
+            .filter(|msg| !matches!(msg.role, Role::System))
+            .cloned()
+    );
+
+    messages
+}
+```
+
+**Positioning Rules:**
+1. System prompt is extracted from root level or messages array
+2. System prompt becomes the first message in the processed array
+3. All other messages maintain their relative order
+4. Any system messages in the messages array are filtered out to prevent duplication
+
+---
+
+### System Prompt Retrieval
+
+**Purpose:** Retrieves the system prompt from either the root level or messages array for processing.
+
+**Location:** `src/models/request.rs:115-122`
+
+**Retrieval Logic:**
+```rust
+pub fn get_system_prompt(&self) -> Option<&str> {
+    self.system.as_deref().or_else(|| {
+        self.messages
+            .iter()
+            .find(|msg| matches!(msg.role, Role::System))
+            .map(|msg| msg.content.as_str())
+    })
+}
+```
+
+**Retrieval Priority:**
+1. First checks the root level `system` field
+2. If not found, searches the messages array for a system role message
+3. Returns `None` if no system prompt is found in either location
+
+---
+
+### Backend Handler Validation
+
+**Purpose:** Validates system prompts before processing requests through the dual-stage pipeline.
+
+**Location:** `src/handlers.rs`
+
+**Validation Points:**
+
+**Non-Streaming Requests (Lines 204-206):**
+```rust
+if !request.validate_system_prompt() {
+    return Err(ApiError::bad_request("System prompt cannot be provided in both root and messages"));
+}
+```
+
+**Streaming Requests (Lines 470+):**
+```rust
+// Same validation applied to streaming endpoints
+if !request.validate_system_prompt() {
+    return Err(ApiError::bad_request("System prompt cannot be provided in both root and messages"));
+}
+```
+
+**Processing Flow:**
+1. Request received from frontend
+2. System prompt validation performed
+3. If validation passes, messages with system prompt are retrieved
+4. Messages are passed to DeepSeek API (Line 216-217)
+5. DeepSeek reasoning is extracted
+6. Messages + reasoning are passed to Anthropic API (Line 250 or 470)
+
