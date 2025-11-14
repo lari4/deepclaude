@@ -381,3 +381,341 @@ DeepClaude uses a **dual-stage AI processing architecture** that combines two di
 [Thinking Block] + [Claude Response] + [Usage Statistics]
 ```
 
+---
+
+## Streaming Pipeline
+
+**Handler:** `chat_stream()` in `src/handlers.rs:338-598`
+
+**Purpose:** Processes requests asynchronously, streaming responses from both AI models in real-time using Server-Sent Events (SSE). This provides immediate feedback to users as content is generated.
+
+### Data Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    INCOMING HTTP REQUEST                       │
+├────────────────────────────────────────────────────────────────┤
+│ Body:                                                          │
+│   {                                                            │
+│     "system": "You are a helpful AI assistant...",           │
+│     "messages": [...],                                        │
+│     "stream": true,  ← STREAMING ENABLED                     │
+│     "verbose": false                                          │
+│   }                                                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 1-4: SAME AS NON-STREAMING                       │
+│         - Validate system prompt                              │
+│         - Extract API tokens                                  │
+│         - Initialize clients                                  │
+│         - Prepare messages with system prompt                 │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 5: CREATE SSE CHANNEL                            │
+│              (Line 359-360)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ let (tx, rx) = tokio::sync::mpsc::channel(100);              │
+│ let tx = Arc::new(tx);                                        │
+│                                                                │
+│ tx: Sender for SSE events                                     │
+│ rx: Receiver converted to stream for client                  │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 6: SPAWN BACKGROUND TASK                         │
+│              (Line 365)                                        │
+├────────────────────────────────────────────────────────────────┤
+│ tokio::spawn(async move {                                     │
+│     // All streaming logic runs in background                │
+│     // Main handler returns immediately with SSE stream      │
+│ })                                                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 7: SEND START EVENT                              │
+│              (Line 369-376)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Event: "start"                                                │
+│ Data: {                                                        │
+│   "created": "2025-11-14T10:30:00Z"                          │
+│ }                                                              │
+│                                                                │
+│ → Client receives: Stream started                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 8: SEND OPENING THINKING TAG                     │
+│              (Line 379-389)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Event: "content"                                              │
+│ Data: {                                                        │
+│   "content": [{                                               │
+│     "type": "text",                                          │
+│     "text": "<thinking>\n"                                   │
+│   }]                                                           │
+│ }                                                              │
+│                                                                │
+│ → Client displays: "<thinking>\n"                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│    STEP 9: STREAM FROM DEEPSEEK (STAGE 1)                    │
+│              (Line 392-445)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Create stream:                                                │
+│   deepseek_client.chat_stream(messages, &config)             │
+│                                                                │
+│ For each chunk received:                                      │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ CHUNK 1:                                 │                 │
+│ │ delta.reasoning_content = "Let me"      │                 │
+│ │                                          │                 │
+│ │ → Send SSE Event:                       │                 │
+│ │   Event: "content"                      │                 │
+│ │   Data: {                                │                 │
+│ │     "content": [{                        │                 │
+│ │       "type": "text_delta",             │                 │
+│ │       "text": "Let me"                  │                 │
+│ │     }]                                   │                 │
+│ │   }                                      │                 │
+│ │                                          │                 │
+│ │ → Accumulate: complete_reasoning += ...│                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ CHUNK 2:                                 │                 │
+│ │ delta.reasoning_content = " think"      │                 │
+│ │ → Send SSE Event + Accumulate           │                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ... (continues until reasoning_content is null)              │
+│                                                                │
+│ Final accumulated:                                            │
+│   complete_reasoning = "Let me think step by step..."       │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 10: SEND CLOSING THINKING TAG                    │
+│              (Line 448-458)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Event: "content"                                              │
+│ Data: {                                                        │
+│   "content": [{                                               │
+│     "type": "text",                                          │
+│     "text": "\n</thinking>"                                  │
+│   }]                                                           │
+│ }                                                              │
+│                                                                │
+│ → Client displays: "\n</thinking>"                           │
+│ → Thinking block complete and visible to user               │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│    STEP 11: PREPARE MESSAGES FOR CLAUDE (STAGE 2)            │
+│              (Line 461-465)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ anthropic_messages = original_messages                        │
+│                                                                │
+│ Add complete thinking as assistant message:                  │
+│   anthropic_messages.push({                                   │
+│     "role": "assistant",                                      │
+│     "content": "<thinking>\n" +                              │
+│                complete_reasoning +                           │
+│                "\n</thinking>"                                │
+│   })                                                           │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│    STEP 12: STREAM FROM ANTHROPIC (STAGE 2)                  │
+│              (Line 468-584)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Create stream:                                                │
+│   anthropic_client.chat_stream(                              │
+│     anthropic_messages,                                       │
+│     system_prompt,                                            │
+│     &config                                                    │
+│   )                                                            │
+│                                                                │
+│ For each event received:                                      │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ EVENT: MessageStart                      │                 │
+│ │ → Usually empty, no action needed        │                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ EVENT: ContentBlockDelta                 │                 │
+│ │ delta.text = "# Quantum"                │                 │
+│ │                                          │                 │
+│ │ → Send SSE Event:                       │                 │
+│ │   Event: "content"                      │                 │
+│ │   Data: {                                │                 │
+│ │     "content": [{                        │                 │
+│ │       "type": "text_delta",             │                 │
+│ │       "text": "# Quantum"               │                 │
+│ │     }]                                   │                 │
+│ │   }                                      │                 │
+│ │                                          │                 │
+│ │ → Client displays incrementally         │                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ EVENT: ContentBlockDelta                 │                 │
+│ │ delta.text = " Physics\n\n"             │                 │
+│ │ → Send SSE Event + Display              │                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ... (continues until response complete)                      │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ EVENT: MessageDelta                      │                 │
+│ │ usage: { input_tokens, output_tokens }  │                 │
+│ │                                          │                 │
+│ │ → Calculate costs                       │                 │
+│ │ → Send usage event (see Step 13)       │                 │
+│ └──────────────────────────────────────────┘                 │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 13: SEND USAGE STATISTICS                        │
+│              (Line 506-567)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Calculate costs for both DeepSeek and Claude                 │
+│                                                                │
+│ Event: "usage"                                                │
+│ Data: {                                                        │
+│   "usage": {                                                  │
+│     "total_cost": "$0.043",                                  │
+│     "deepseek_usage": {                                      │
+│       "input_tokens": 150,                                   │
+│       "output_tokens": 500,                                  │
+│       "reasoning_tokens": 450,                               │
+│       "cached_input_tokens": 100,                            │
+│       "total_tokens": 650,                                   │
+│       "total_cost": "$0.025"                                 │
+│     },                                                         │
+│     "anthropic_usage": {                                     │
+│       "input_tokens": 1200,                                  │
+│       "output_tokens": 800,                                  │
+│       "cached_write_tokens": 0,                              │
+│       "cached_read_tokens": 500,                             │
+│       "total_tokens": 2000,                                  │
+│       "total_cost": "$0.018"                                 │
+│     }                                                          │
+│   }                                                            │
+│ }                                                              │
+│                                                                │
+│ → Client displays usage statistics                           │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 14: SEND DONE EVENT                              │
+│              (Line 587-592)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Event: "done"                                                 │
+│ Data: {}                                                       │
+│                                                                │
+│ → Client knows stream is complete                            │
+│ → Close SSE connection                                       │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Streaming Event Types
+
+**Event: `start`**
+- Sent when stream begins
+- Contains timestamp
+- No content data
+
+**Event: `content`**
+- Sent for each content chunk
+- Can be `text` (complete block) or `text_delta` (incremental chunk)
+- Sent for both DeepSeek reasoning and Claude responses
+
+**Event: `usage`**
+- Sent at the end of Claude's response
+- Contains complete usage statistics and costs for both models
+
+**Event: `done`**
+- Sent when stream is complete
+- Signals client to close connection
+
+**Event: `error`**
+- Sent when an error occurs
+- Contains error message and code
+- Stream terminates after error event
+
+### Timeline Visualization
+
+```
+Time →
+
+0ms     ├─ Event: "start"
+        │
+50ms    ├─ Event: "content" → "<thinking>\n"
+        │
+        ├─ [DEEPSEEK STREAMING BEGINS]
+100ms   ├─ Event: "content" → "Let me"
+150ms   ├─ Event: "content" → " think"
+200ms   ├─ Event: "content" → " step"
+...     │  ... (DeepSeek reasoning continues)
+        │
+2000ms  ├─ Event: "content" → "\n</thinking>"
+        │
+        ├─ [DEEPSEEK COMPLETE, CLAUDE STREAMING BEGINS]
+2050ms  ├─ Event: "content" → "# Quantum"
+2100ms  ├─ Event: "content" → " Physics"
+2150ms  ├─ Event: "content" → "\n\nQuantum"
+...     │  ... (Claude response continues)
+        │
+5000ms  ├─ Event: "usage" → {total_cost: "$0.043", ...}
+        │
+5050ms  ├─ Event: "done"
+        │
+        └─ [STREAM CLOSED]
+```
+
+### Data Transformations
+
+**Input → DeepSeek Stream:**
+```
+[System Prompt] + [User Messages] → DeepSeek R1 Stream
+→ Multiple delta events with reasoning chunks
+→ Accumulated into complete_reasoning
+```
+
+**DeepSeek → Claude Stream:**
+```
+[System Prompt] + [User Messages] + [Assistant: <thinking>complete_reasoning</thinking>]
+→ Claude Stream
+→ Multiple delta events with response chunks
+```
+
+**Output Stream:**
+```
+start → <thinking> → reasoning deltas... → </thinking> →
+response deltas... → usage → done
+```
+
+### Key Differences from Non-Streaming
+
+1. **Immediate Response:** Handler returns SSE stream immediately, processing happens in background
+2. **Progressive Display:** Content is visible to user as it's generated
+3. **Real-time Feedback:** User sees DeepSeek's thinking process in real-time
+4. **Event-Based:** Uses SSE events instead of single JSON response
+5. **Async Processing:** Main handler spawns background task, doesn't block
+
