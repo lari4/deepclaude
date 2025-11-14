@@ -719,3 +719,452 @@ response deltas... → usage → done
 4. **Event-Based:** Uses SSE events instead of single JSON response
 5. **Async Processing:** Main handler spawns background task, doesn't block
 
+---
+
+## Authentication Pipeline
+
+**Handler:** `extract_api_tokens()` in `src/handlers.rs:49-75`
+
+**Purpose:** Extracts and validates API tokens from request headers for both DeepSeek and Anthropic services.
+
+### Data Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     INCOMING HEADERS                           │
+├────────────────────────────────────────────────────────────────┤
+│ X-DeepSeek-API-Token: "sk-deepseek-abc123..."                │
+│ X-Anthropic-API-Token: "sk-ant-api03-xyz789..."              │
+│ Content-Type: "application/json"                              │
+│ ... other headers ...                                          │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 1: EXTRACT DEEPSEEK TOKEN                        │
+│              (Line 52-61)                                      │
+├────────────────────────────────────────────────────────────────┤
+│ headers.get("X-DeepSeek-API-Token")                          │
+│                                                                │
+│ ✓ Token present → Continue                                   │
+│ ✗ Token missing → ApiError::MissingHeader                    │
+│                                                                │
+│ Validate token is valid UTF-8:                                │
+│ ✓ Valid → Convert to String                                  │
+│ ✗ Invalid → ApiError::BadRequest                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 2: EXTRACT ANTHROPIC TOKEN                       │
+│              (Line 63-72)                                      │
+├────────────────────────────────────────────────────────────────┤
+│ headers.get("X-Anthropic-API-Token")                         │
+│                                                                │
+│ ✓ Token present → Continue                                   │
+│ ✗ Token missing → ApiError::MissingHeader                    │
+│                                                                │
+│ Validate token is valid UTF-8:                                │
+│ ✓ Valid → Convert to String                                  │
+│ ✗ Invalid → ApiError::BadRequest                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 3: RETURN TOKEN TUPLE                            │
+│              (Line 74)                                         │
+├────────────────────────────────────────────────────────────────┤
+│ Ok((deepseek_token, anthropic_token))                         │
+│                                                                │
+│ Returns:                                                       │
+│   ("sk-deepseek-abc123...", "sk-ant-api03-xyz789...")        │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Error Handling
+
+**Missing DeepSeek Token:**
+```
+HTTP 400 Bad Request
+{
+  "error": "Missing required header: X-DeepSeek-API-Token"
+}
+```
+
+**Missing Anthropic Token:**
+```
+HTTP 400 Bad Request
+{
+  "error": "Missing required header: X-Anthropic-API-Token"
+}
+```
+
+**Invalid Token Format:**
+```
+HTTP 400 Bad Request
+{
+  "error": "Invalid DeepSeek API token" | "Invalid Anthropic API token"
+}
+```
+
+---
+
+## Validation Pipeline
+
+**Handler:** `validate_system_prompt()` in `src/models/request.rs:75-80`
+
+**Purpose:** Ensures system prompts are not duplicated in both root level and messages array, which would cause API errors.
+
+### Data Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     INCOMING REQUEST                           │
+├────────────────────────────────────────────────────────────────┤
+│ SCENARIO 1: System prompt in root only (VALID)               │
+│ {                                                              │
+│   "system": "You are helpful...",                            │
+│   "messages": [                                               │
+│     {"role": "user", "content": "Hello"}                     │
+│   ]                                                            │
+│ }                                                              │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         CHECK 1: SYSTEM IN MESSAGES?                          │
+├────────────────────────────────────────────────────────────────┤
+│ messages.iter().any(|msg| msg.role == Role::System)          │
+│                                                                │
+│ Result: false (no system message in messages)                │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         CHECK 2: SYSTEM IN ROOT?                              │
+├────────────────────────────────────────────────────────────────┤
+│ self.system.is_some()                                         │
+│                                                                │
+│ Result: true (system prompt in root)                         │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         VALIDATION RESULT                                      │
+├────────────────────────────────────────────────────────────────┤
+│ !(system.is_some() && system_in_messages)                    │
+│ = !(true && false)                                            │
+│ = !false                                                       │
+│ = true ✓ VALID                                                │
+└────────────────────────────────────────────────────────────────┘
+
+---
+
+┌────────────────────────────────────────────────────────────────┐
+│ SCENARIO 2: System prompt in both places (INVALID)           │
+│ {                                                              │
+│   "system": "You are helpful...",                            │
+│   "messages": [                                               │
+│     {"role": "system", "content": "You are helpful..."},     │
+│     {"role": "user", "content": "Hello"}                     │
+│   ]                                                            │
+│ }                                                              │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         CHECK 1: SYSTEM IN MESSAGES?                          │
+├────────────────────────────────────────────────────────────────┤
+│ Result: true (system message found in messages)              │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         CHECK 2: SYSTEM IN ROOT?                              │
+├────────────────────────────────────────────────────────────────┤
+│ Result: true (system prompt in root)                         │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         VALIDATION RESULT                                      │
+├────────────────────────────────────────────────────────────────┤
+│ !(system.is_some() && system_in_messages)                    │
+│ = !(true && true)                                             │
+│ = !true                                                        │
+│ = false ✗ INVALID                                             │
+│                                                                │
+│ → Returns: ApiError::InvalidSystemPrompt                     │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Validation Matrix
+
+| Root System | Messages System | Result  | Reason                    |
+|-------------|----------------|---------|---------------------------|
+| ✓ Present   | ✗ Absent       | ✓ Valid | Only in root              |
+| ✗ Absent    | ✓ Present      | ✓ Valid | Only in messages          |
+| ✗ Absent    | ✗ Absent       | ✓ Valid | Optional, can be omitted  |
+| ✓ Present   | ✓ Present      | ✗ Error | Duplicate system prompt   |
+
+---
+
+## Cost Calculation Pipeline
+
+### DeepSeek Cost Calculation
+
+**Handler:** `calculate_deepseek_cost()` in `src/handlers.rs:90-102`
+
+**Purpose:** Calculates the total cost for DeepSeek API usage based on token consumption and pricing tiers.
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                   DEEPSEEK USAGE DATA                          │
+├────────────────────────────────────────────────────────────────┤
+│ prompt_tokens: 150                                            │
+│ completion_tokens: 500                                        │
+│ reasoning_tokens: 450                                         │
+│ cached_tokens: 100                                            │
+│ total_tokens: 650                                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 1: CALCULATE CACHE HIT COST                      │
+├────────────────────────────────────────────────────────────────┤
+│ Formula:                                                       │
+│   (cached_tokens / 1,000,000) * cache_hit_price              │
+│                                                                │
+│ Calculation:                                                   │
+│   (100 / 1,000,000) * $0.14                                   │
+│ = 0.0001 * $0.14                                              │
+│ = $0.000014                                                    │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 2: CALCULATE CACHE MISS COST                     │
+├────────────────────────────────────────────────────────────────┤
+│ Formula:                                                       │
+│   ((input_tokens - cached_tokens) / 1,000,000) * miss_price  │
+│                                                                │
+│ Calculation:                                                   │
+│   ((150 - 100) / 1,000,000) * $0.55                          │
+│ = (50 / 1,000,000) * $0.55                                    │
+│ = 0.00005 * $0.55                                             │
+│ = $0.0000275                                                   │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 3: CALCULATE OUTPUT COST                         │
+├────────────────────────────────────────────────────────────────┤
+│ Formula:                                                       │
+│   (output_tokens / 1,000,000) * output_price                 │
+│                                                                │
+│ Calculation:                                                   │
+│   (500 / 1,000,000) * $2.19                                   │
+│ = 0.0005 * $2.19                                              │
+│ = $0.001095                                                    │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 4: CALCULATE TOTAL COST                          │
+├────────────────────────────────────────────────────────────────┤
+│ Total = cache_hit_cost + cache_miss_cost + output_cost       │
+│       = $0.000014 + $0.0000275 + $0.001095                   │
+│       = $0.0011365                                            │
+│                                                                │
+│ Formatted: "$0.001"                                           │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Anthropic Cost Calculation
+
+**Handler:** `calculate_anthropic_cost()` in `src/handlers.rs:118-142`
+
+**Purpose:** Calculates the total cost for Anthropic Claude API usage based on model tier and token consumption.
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                   ANTHROPIC USAGE DATA                         │
+├────────────────────────────────────────────────────────────────┤
+│ model: "claude-3-5-sonnet-20241022"                          │
+│ input_tokens: 1200                                            │
+│ output_tokens: 800                                            │
+│ cache_creation_input_tokens: 0                                │
+│ cache_read_input_tokens: 500                                  │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 1: SELECT PRICING TIER                           │
+│              (Line 126-134)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Model contains "claude-3-5-sonnet"? → Yes                    │
+│                                                                │
+│ Selected Pricing:                                             │
+│   - input_price: $3.00 per 1M tokens                         │
+│   - output_price: $15.00 per 1M tokens                       │
+│   - cache_write_price: $3.75 per 1M tokens                   │
+│   - cache_read_price: $0.30 per 1M tokens                    │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 2: CALCULATE INPUT COST                          │
+├────────────────────────────────────────────────────────────────┤
+│ (1200 / 1,000,000) * $3.00 = $0.0036                         │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 3: CALCULATE OUTPUT COST                         │
+├────────────────────────────────────────────────────────────────┤
+│ (800 / 1,000,000) * $15.00 = $0.012                          │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 4: CALCULATE CACHE WRITE COST                    │
+├────────────────────────────────────────────────────────────────┤
+│ (0 / 1,000,000) * $3.75 = $0.000                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 5: CALCULATE CACHE READ COST                     │
+├────────────────────────────────────────────────────────────────┤
+│ (500 / 1,000,000) * $0.30 = $0.00015                         │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 6: CALCULATE TOTAL COST                          │
+├────────────────────────────────────────────────────────────────┤
+│ Total = input + output + cache_write + cache_read            │
+│       = $0.0036 + $0.012 + $0.000 + $0.00015                 │
+│       = $0.01575                                              │
+│                                                                │
+│ Formatted: "$0.016"                                           │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Pricing Tiers
+
+**DeepSeek Pricing** (per 1M tokens):
+- Input Cache Hit: $0.14
+- Input Cache Miss: $0.55
+- Output: $2.19
+
+**Claude 3.5 Sonnet Pricing** (per 1M tokens):
+- Input: $3.00
+- Output: $15.00
+- Cache Write: $3.75
+- Cache Read: $0.30
+
+**Claude 3.5 Haiku Pricing** (per 1M tokens):
+- Input: $0.80
+- Output: $4.00
+- Cache Write: $1.00
+- Cache Read: $0.08
+
+**Claude 3 Opus Pricing** (per 1M tokens):
+- Input: $15.00
+- Output: $75.00
+- Cache Write: $18.75
+- Cache Read: $1.50
+
+---
+
+## Error Handling Pipeline
+
+**Purpose:** Handles errors at various stages of request processing and returns appropriate HTTP error responses.
+
+### Error Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     ERROR SOURCES                              │
+├────────────────────────────────────────────────────────────────┤
+│ 1. Missing API tokens                                         │
+│ 2. Invalid system prompt (duplicate)                          │
+│ 3. DeepSeek API errors                                        │
+│ 4. Anthropic API errors                                       │
+│ 5. Network errors                                             │
+│ 6. Parsing errors                                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         ERROR TYPE DETERMINATION                               │
+├────────────────────────────────────────────────────────────────┤
+│ ApiError::MissingHeader                                       │
+│   → HTTP 400 Bad Request                                      │
+│   → Body: {"error": "Missing required header: X-..."}        │
+│                                                                │
+│ ApiError::InvalidSystemPrompt                                 │
+│   → HTTP 400 Bad Request                                      │
+│   → Body: {"error": "System prompt cannot be provided..."}   │
+│                                                                │
+│ ApiError::DeepSeekError                                       │
+│   → HTTP 502 Bad Gateway                                      │
+│   → Body: {"error": "DeepSeek API error: ..."}               │
+│                                                                │
+│ ApiError::AnthropicError                                      │
+│   → HTTP 502 Bad Gateway                                      │
+│   → Body: {"error": "Anthropic API error: ..."}              │
+│                                                                │
+│ ApiError::BadRequest                                          │
+│   → HTTP 400 Bad Request                                      │
+│   → Body: {"error": "<message>"}                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STREAMING ERROR HANDLING                               │
+├────────────────────────────────────────────────────────────────┤
+│ If error occurs during streaming:                             │
+│                                                                │
+│ Event: "error"                                                │
+│ Data: {                                                        │
+│   "message": "Error description",                            │
+│   "code": 500                                                 │
+│ }                                                              │
+│                                                                │
+│ → Stream terminates                                           │
+│ → No "done" event sent                                       │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Example Error Responses
+
+**Missing Header Error:**
+```json
+{
+  "error": "Missing required header: X-DeepSeek-API-Token"
+}
+```
+
+**Duplicate System Prompt Error:**
+```json
+{
+  "error": "System prompt cannot be provided in both root and messages"
+}
+```
+
+**DeepSeek API Error:**
+```json
+{
+  "error": "DeepSeek API error: No reasoning content in response",
+  "type": "missing_content"
+}
+```
+
+**Streaming Error Event:**
+```
+event: error
+data: {"message":"DeepSeek stream error: Connection timeout","code":500}
+```
+
