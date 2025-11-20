@@ -1,0 +1,1170 @@
+# Agent Pipelines Documentation
+
+This document provides a comprehensive overview of all agent workflows and data pipelines in the DeepClaude application, describing how prompts, messages, and data flow through the dual-stage AI processing system.
+
+## Table of Contents
+
+1. [Architecture Overview](#architecture-overview)
+2. [Non-Streaming Pipeline](#non-streaming-pipeline)
+3. [Streaming Pipeline](#streaming-pipeline)
+4. [Authentication Pipeline](#authentication-pipeline)
+5. [Validation Pipeline](#validation-pipeline)
+6. [Cost Calculation Pipeline](#cost-calculation-pipeline)
+7. [Error Handling Pipeline](#error-handling-pipeline)
+
+---
+
+## Architecture Overview
+
+### Dual-Stage Processing Model
+
+DeepClaude uses a **dual-stage AI processing architecture** that combines two different AI models for enhanced reasoning and response quality:
+
+**Stage 1 - DeepSeek R1 (Reasoning):**
+- Performs deep Chain-of-Thought reasoning
+- Generates detailed thinking process
+- Outputs structured reasoning in `<think>` tags
+
+**Stage 2 - Claude (Synthesis):**
+- Receives DeepSeek's reasoning as context
+- Synthesizes creative, well-formatted responses
+- Leverages DeepSeek's reasoning for higher quality outputs
+
+### High-Level Architecture
+
+```
+┌─────────────┐
+│   Client    │
+│  (Frontend) │
+└──────┬──────┘
+       │
+       │ HTTP Request (JSON)
+       │ - system prompt
+       │ - messages
+       │ - config options
+       ▼
+┌─────────────────────────────────────┐
+│         Backend Handler             │
+│  (src/handlers.rs)                  │
+├─────────────────────────────────────┤
+│  1. Validate system prompt          │
+│  2. Extract API tokens              │
+│  3. Route to stream/non-stream      │
+└──────┬──────────────────────────────┘
+       │
+       ├─────────────┬─────────────┐
+       │             │             │
+       ▼             ▼             ▼
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│ DeepSeek │  │  Extract │  │  Claude  │
+│   API    │─▶│ Reasoning│─▶│   API    │
+└──────────┘  └──────────┘  └──────────┘
+   Stage 1        Stage 1.5     Stage 2
+
+       │             │             │
+       └─────────────┴─────────────┘
+                    │
+                    ▼
+            ┌───────────────┐
+            │   Response    │
+            │   Builder     │
+            └───────┬───────┘
+                    │
+                    ▼
+            ┌───────────────┐
+            │    Client     │
+            │  (Frontend)   │
+            └───────────────┘
+```
+
+### Key Components
+
+**Location:** `src/handlers.rs`
+
+**Main Handler:**
+- `handle_chat()` - Routes to streaming or non-streaming based on request
+
+**Processing Handlers:**
+- `chat()` - Non-streaming request processor (Line 199)
+- `chat_stream()` - Streaming request processor (Line 338)
+
+**Support Functions:**
+- `extract_api_tokens()` - Extracts authentication tokens (Line 49)
+- `calculate_deepseek_cost()` - Calculates DeepSeek usage costs (Line 90)
+- `calculate_anthropic_cost()` - Calculates Claude usage costs (Line 118)
+
+---
+
+## Non-Streaming Pipeline
+
+**Handler:** `chat()` in `src/handlers.rs:199-322`
+
+**Purpose:** Processes requests synchronously, waiting for complete responses from both AI models before returning a single JSON response to the client.
+
+### Data Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    INCOMING HTTP REQUEST                       │
+├────────────────────────────────────────────────────────────────┤
+│ Headers:                                                       │
+│   - X-DeepSeek-API-Token: "sk-..."                           │
+│   - X-Anthropic-API-Token: "sk-ant-..."                      │
+│                                                                │
+│ Body:                                                          │
+│   {                                                            │
+│     "system": "You are a helpful AI assistant...",           │
+│     "messages": [                                             │
+│       {"role": "user", "content": "Explain quantum physics"} │
+│     ],                                                         │
+│     "stream": false,                                          │
+│     "verbose": false,                                         │
+│     "deepseek_config": {...},                                │
+│     "anthropic_config": {...}                                │
+│   }                                                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│              STEP 1: VALIDATE SYSTEM PROMPT                    │
+│              (Line 204-207)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Function: request.validate_system_prompt()                    │
+│                                                                │
+│ Checks:                                                        │
+│   ✓ System prompt not in both root AND messages              │
+│   ✓ Returns true if valid, false if duplicate                │
+│                                                                │
+│ Error: Returns BAD_REQUEST if validation fails               │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│              STEP 2: EXTRACT API TOKENS                        │
+│              (Line 210)                                        │
+├────────────────────────────────────────────────────────────────┤
+│ Function: extract_api_tokens(&headers)                        │
+│                                                                │
+│ Extracts:                                                      │
+│   - deepseek_token: "sk-..."                                  │
+│   - anthropic_token: "sk-ant-..."                             │
+│                                                                │
+│ Returns: (deepseek_token, anthropic_token)                    │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│              STEP 3: INITIALIZE CLIENTS                        │
+│              (Line 213-214)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ deepseek_client = DeepSeekClient::new(deepseek_token)        │
+│ anthropic_client = AnthropicClient::new(anthropic_token)      │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 4: PREPARE MESSAGES WITH SYSTEM PROMPT            │
+│              (Line 217)                                        │
+├────────────────────────────────────────────────────────────────┤
+│ Function: request.get_messages_with_system()                  │
+│                                                                │
+│ Output:                                                        │
+│   messages = [                                                 │
+│     {                                                          │
+│       "role": "system",                                       │
+│       "content": "You are a helpful AI assistant..."         │
+│     },                                                         │
+│     {                                                          │
+│       "role": "user",                                         │
+│       "content": "Explain quantum physics"                   │
+│     }                                                          │
+│   ]                                                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 5: CALL DEEPSEEK API (STAGE 1)                   │
+│              (Line 220)                                        │
+├────────────────────────────────────────────────────────────────┤
+│ deepseek_client.chat(messages, &deepseek_config)             │
+│                                                                │
+│ Sends to DeepSeek:                                            │
+│   - All messages (including system prompt)                    │
+│   - Custom config (temperature, max_tokens, etc.)            │
+│                                                                │
+│ DeepSeek Response:                                            │
+│   {                                                            │
+│     "choices": [{                                             │
+│       "message": {                                            │
+│         "reasoning_content": "Let me think step by step...",│
+│         "content": ""                                        │
+│       }                                                        │
+│     }],                                                        │
+│     "usage": {                                                │
+│       "prompt_tokens": 150,                                  │
+│       "completion_tokens": 500,                              │
+│       "completion_tokens_details": {                         │
+│         "reasoning_tokens": 450                              │
+│       },                                                      │
+│       "prompt_tokens_details": {                             │
+│         "cached_tokens": 100                                 │
+│       },                                                      │
+│       "total_tokens": 650                                    │
+│     }                                                          │
+│   }                                                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 6: EXTRACT REASONING CONTENT                      │
+│              (Line 227-238)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Extract from: deepseek_response.choices[0].message            │
+│                      .reasoning_content                        │
+│                                                                │
+│ Raw reasoning:                                                 │
+│   "Let me think step by step about quantum physics:          │
+│    1. Quantum mechanics describes behavior at atomic scale   │
+│    2. Key principles include wave-particle duality...        │
+│    [detailed reasoning chain]"                               │
+│                                                                │
+│ Wrap in thinking tags:                                        │
+│   thinking_content = "<thinking>\n" +                         │
+│                      reasoning_content +                      │
+│                      "\n</thinking>"                          │
+│                                                                │
+│ Result:                                                        │
+│   "<thinking>                                                 │
+│    Let me think step by step about quantum physics:          │
+│    [full reasoning content]                                   │
+│    </thinking>"                                               │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│    STEP 7: PREPARE MESSAGES FOR CLAUDE (STAGE 2)             │
+│              (Line 241-245)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ anthropic_messages = messages (from Step 4)                   │
+│                                                                │
+│ Add DeepSeek's reasoning as assistant message:               │
+│   anthropic_messages.push({                                   │
+│     "role": "assistant",                                      │
+│     "content": thinking_content                              │
+│   })                                                           │
+│                                                                │
+│ Result:                                                        │
+│   [                                                            │
+│     {"role": "system", "content": "You are..."},             │
+│     {"role": "user", "content": "Explain quantum physics"},  │
+│     {"role": "assistant", "content": "<thinking>..."}        │
+│   ]                                                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 8: CALL ANTHROPIC API (STAGE 2)                  │
+│              (Line 248-252)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ anthropic_client.chat(                                        │
+│   anthropic_messages,                                         │
+│   system_prompt,                                              │
+│   &anthropic_config                                           │
+│ )                                                              │
+│                                                                │
+│ Claude receives:                                              │
+│   - Original user question                                    │
+│   - DeepSeek's complete reasoning chain                      │
+│   - System prompt                                             │
+│                                                                │
+│ Claude Response:                                              │
+│   {                                                            │
+│     "model": "claude-3-5-sonnet-20241022",                   │
+│     "content": [{                                             │
+│       "type": "text",                                        │
+│       "text": "# Quantum Physics Explained\n\n..."          │
+│     }],                                                        │
+│     "usage": {                                                │
+│       "input_tokens": 1200,                                  │
+│       "output_tokens": 800,                                  │
+│       "cache_creation_input_tokens": 0,                      │
+│       "cache_read_input_tokens": 500                         │
+│     }                                                          │
+│   }                                                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 9: CALCULATE USAGE COSTS                          │
+│              (Line 259-274)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ DeepSeek Cost Calculation:                                    │
+│   - Cache hit cost: (cached_tokens / 1M) * cache_hit_price   │
+│   - Cache miss cost: (input - cached / 1M) * miss_price      │
+│   - Output cost: (output_tokens / 1M) * output_price         │
+│   Total: $0.025                                               │
+│                                                                │
+│ Anthropic Cost Calculation:                                   │
+│   - Input cost: (input_tokens / 1M) * input_price            │
+│   - Output cost: (output_tokens / 1M) * output_price         │
+│   - Cache write: (cache_write_tokens / 1M) * write_price    │
+│   - Cache read: (cache_read_tokens / 1M) * read_price       │
+│   Total: $0.018                                               │
+│                                                                │
+│ Combined Total: $0.043                                        │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 10: BUILD COMBINED RESPONSE                       │
+│              (Line 277-319)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ content = []                                                   │
+│                                                                │
+│ 1. Add thinking block first:                                  │
+│    content.push(ContentBlock::text(thinking_content))        │
+│                                                                │
+│ 2. Add Claude's response blocks:                             │
+│    content.extend(anthropic_response.content)                │
+│                                                                │
+│ 3. Build ApiResponse:                                         │
+│    - created: timestamp                                       │
+│    - content: [thinking + claude response]                   │
+│    - deepseek_response: (if verbose=true)                    │
+│    - anthropic_response: (if verbose=true)                   │
+│    - combined_usage: {                                        │
+│        total_cost: "$0.043",                                 │
+│        deepseek_usage: {...},                                │
+│        anthropic_usage: {...}                                │
+│      }                                                         │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│                   RETURN JSON RESPONSE                         │
+├────────────────────────────────────────────────────────────────┤
+│ {                                                              │
+│   "created": "2025-11-14T10:30:00Z",                         │
+│   "content": [                                                │
+│     {                                                          │
+│       "type": "text",                                         │
+│       "text": "<thinking>DeepSeek reasoning...</thinking>"   │
+│     },                                                         │
+│     {                                                          │
+│       "type": "text",                                         │
+│       "text": "# Quantum Physics Explained\n\n..."          │
+│     }                                                          │
+│   ],                                                           │
+│   "combined_usage": {                                         │
+│     "total_cost": "$0.043",                                  │
+│     "deepseek_usage": {...},                                 │
+│     "anthropic_usage": {...}                                 │
+│   }                                                            │
+│ }                                                              │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Data Transformations
+
+**Input → Stage 1 (DeepSeek):**
+```
+[System Prompt] + [User Messages] → DeepSeek R1 → Reasoning Content
+```
+
+**Stage 1 → Stage 2 (Claude):**
+```
+[System Prompt] + [User Messages] + [Assistant: <thinking>Reasoning</thinking>] → Claude → Final Response
+```
+
+**Output:**
+```
+[Thinking Block] + [Claude Response] + [Usage Statistics]
+```
+
+---
+
+## Streaming Pipeline
+
+**Handler:** `chat_stream()` in `src/handlers.rs:338-598`
+
+**Purpose:** Processes requests asynchronously, streaming responses from both AI models in real-time using Server-Sent Events (SSE). This provides immediate feedback to users as content is generated.
+
+### Data Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    INCOMING HTTP REQUEST                       │
+├────────────────────────────────────────────────────────────────┤
+│ Body:                                                          │
+│   {                                                            │
+│     "system": "You are a helpful AI assistant...",           │
+│     "messages": [...],                                        │
+│     "stream": true,  ← STREAMING ENABLED                     │
+│     "verbose": false                                          │
+│   }                                                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 1-4: SAME AS NON-STREAMING                       │
+│         - Validate system prompt                              │
+│         - Extract API tokens                                  │
+│         - Initialize clients                                  │
+│         - Prepare messages with system prompt                 │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 5: CREATE SSE CHANNEL                            │
+│              (Line 359-360)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ let (tx, rx) = tokio::sync::mpsc::channel(100);              │
+│ let tx = Arc::new(tx);                                        │
+│                                                                │
+│ tx: Sender for SSE events                                     │
+│ rx: Receiver converted to stream for client                  │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 6: SPAWN BACKGROUND TASK                         │
+│              (Line 365)                                        │
+├────────────────────────────────────────────────────────────────┤
+│ tokio::spawn(async move {                                     │
+│     // All streaming logic runs in background                │
+│     // Main handler returns immediately with SSE stream      │
+│ })                                                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 7: SEND START EVENT                              │
+│              (Line 369-376)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Event: "start"                                                │
+│ Data: {                                                        │
+│   "created": "2025-11-14T10:30:00Z"                          │
+│ }                                                              │
+│                                                                │
+│ → Client receives: Stream started                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 8: SEND OPENING THINKING TAG                     │
+│              (Line 379-389)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Event: "content"                                              │
+│ Data: {                                                        │
+│   "content": [{                                               │
+│     "type": "text",                                          │
+│     "text": "<thinking>\n"                                   │
+│   }]                                                           │
+│ }                                                              │
+│                                                                │
+│ → Client displays: "<thinking>\n"                            │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│    STEP 9: STREAM FROM DEEPSEEK (STAGE 1)                    │
+│              (Line 392-445)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Create stream:                                                │
+│   deepseek_client.chat_stream(messages, &config)             │
+│                                                                │
+│ For each chunk received:                                      │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ CHUNK 1:                                 │                 │
+│ │ delta.reasoning_content = "Let me"      │                 │
+│ │                                          │                 │
+│ │ → Send SSE Event:                       │                 │
+│ │   Event: "content"                      │                 │
+│ │   Data: {                                │                 │
+│ │     "content": [{                        │                 │
+│ │       "type": "text_delta",             │                 │
+│ │       "text": "Let me"                  │                 │
+│ │     }]                                   │                 │
+│ │   }                                      │                 │
+│ │                                          │                 │
+│ │ → Accumulate: complete_reasoning += ...│                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ CHUNK 2:                                 │                 │
+│ │ delta.reasoning_content = " think"      │                 │
+│ │ → Send SSE Event + Accumulate           │                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ... (continues until reasoning_content is null)              │
+│                                                                │
+│ Final accumulated:                                            │
+│   complete_reasoning = "Let me think step by step..."       │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 10: SEND CLOSING THINKING TAG                    │
+│              (Line 448-458)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Event: "content"                                              │
+│ Data: {                                                        │
+│   "content": [{                                               │
+│     "type": "text",                                          │
+│     "text": "\n</thinking>"                                  │
+│   }]                                                           │
+│ }                                                              │
+│                                                                │
+│ → Client displays: "\n</thinking>"                           │
+│ → Thinking block complete and visible to user               │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│    STEP 11: PREPARE MESSAGES FOR CLAUDE (STAGE 2)            │
+│              (Line 461-465)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ anthropic_messages = original_messages                        │
+│                                                                │
+│ Add complete thinking as assistant message:                  │
+│   anthropic_messages.push({                                   │
+│     "role": "assistant",                                      │
+│     "content": "<thinking>\n" +                              │
+│                complete_reasoning +                           │
+│                "\n</thinking>"                                │
+│   })                                                           │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│    STEP 12: STREAM FROM ANTHROPIC (STAGE 2)                  │
+│              (Line 468-584)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Create stream:                                                │
+│   anthropic_client.chat_stream(                              │
+│     anthropic_messages,                                       │
+│     system_prompt,                                            │
+│     &config                                                    │
+│   )                                                            │
+│                                                                │
+│ For each event received:                                      │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ EVENT: MessageStart                      │                 │
+│ │ → Usually empty, no action needed        │                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ EVENT: ContentBlockDelta                 │                 │
+│ │ delta.text = "# Quantum"                │                 │
+│ │                                          │                 │
+│ │ → Send SSE Event:                       │                 │
+│ │   Event: "content"                      │                 │
+│ │   Data: {                                │                 │
+│ │     "content": [{                        │                 │
+│ │       "type": "text_delta",             │                 │
+│ │       "text": "# Quantum"               │                 │
+│ │     }]                                   │                 │
+│ │   }                                      │                 │
+│ │                                          │                 │
+│ │ → Client displays incrementally         │                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ EVENT: ContentBlockDelta                 │                 │
+│ │ delta.text = " Physics\n\n"             │                 │
+│ │ → Send SSE Event + Display              │                 │
+│ └──────────────────────────────────────────┘                 │
+│                                                                │
+│ ... (continues until response complete)                      │
+│                                                                │
+│ ┌──────────────────────────────────────────┐                 │
+│ │ EVENT: MessageDelta                      │                 │
+│ │ usage: { input_tokens, output_tokens }  │                 │
+│ │                                          │                 │
+│ │ → Calculate costs                       │                 │
+│ │ → Send usage event (see Step 13)       │                 │
+│ └──────────────────────────────────────────┘                 │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 13: SEND USAGE STATISTICS                        │
+│              (Line 506-567)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Calculate costs for both DeepSeek and Claude                 │
+│                                                                │
+│ Event: "usage"                                                │
+│ Data: {                                                        │
+│   "usage": {                                                  │
+│     "total_cost": "$0.043",                                  │
+│     "deepseek_usage": {                                      │
+│       "input_tokens": 150,                                   │
+│       "output_tokens": 500,                                  │
+│       "reasoning_tokens": 450,                               │
+│       "cached_input_tokens": 100,                            │
+│       "total_tokens": 650,                                   │
+│       "total_cost": "$0.025"                                 │
+│     },                                                         │
+│     "anthropic_usage": {                                     │
+│       "input_tokens": 1200,                                  │
+│       "output_tokens": 800,                                  │
+│       "cached_write_tokens": 0,                              │
+│       "cached_read_tokens": 500,                             │
+│       "total_tokens": 2000,                                  │
+│       "total_cost": "$0.018"                                 │
+│     }                                                          │
+│   }                                                            │
+│ }                                                              │
+│                                                                │
+│ → Client displays usage statistics                           │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 14: SEND DONE EVENT                              │
+│              (Line 587-592)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Event: "done"                                                 │
+│ Data: {}                                                       │
+│                                                                │
+│ → Client knows stream is complete                            │
+│ → Close SSE connection                                       │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Streaming Event Types
+
+**Event: `start`**
+- Sent when stream begins
+- Contains timestamp
+- No content data
+
+**Event: `content`**
+- Sent for each content chunk
+- Can be `text` (complete block) or `text_delta` (incremental chunk)
+- Sent for both DeepSeek reasoning and Claude responses
+
+**Event: `usage`**
+- Sent at the end of Claude's response
+- Contains complete usage statistics and costs for both models
+
+**Event: `done`**
+- Sent when stream is complete
+- Signals client to close connection
+
+**Event: `error`**
+- Sent when an error occurs
+- Contains error message and code
+- Stream terminates after error event
+
+### Timeline Visualization
+
+```
+Time →
+
+0ms     ├─ Event: "start"
+        │
+50ms    ├─ Event: "content" → "<thinking>\n"
+        │
+        ├─ [DEEPSEEK STREAMING BEGINS]
+100ms   ├─ Event: "content" → "Let me"
+150ms   ├─ Event: "content" → " think"
+200ms   ├─ Event: "content" → " step"
+...     │  ... (DeepSeek reasoning continues)
+        │
+2000ms  ├─ Event: "content" → "\n</thinking>"
+        │
+        ├─ [DEEPSEEK COMPLETE, CLAUDE STREAMING BEGINS]
+2050ms  ├─ Event: "content" → "# Quantum"
+2100ms  ├─ Event: "content" → " Physics"
+2150ms  ├─ Event: "content" → "\n\nQuantum"
+...     │  ... (Claude response continues)
+        │
+5000ms  ├─ Event: "usage" → {total_cost: "$0.043", ...}
+        │
+5050ms  ├─ Event: "done"
+        │
+        └─ [STREAM CLOSED]
+```
+
+### Data Transformations
+
+**Input → DeepSeek Stream:**
+```
+[System Prompt] + [User Messages] → DeepSeek R1 Stream
+→ Multiple delta events with reasoning chunks
+→ Accumulated into complete_reasoning
+```
+
+**DeepSeek → Claude Stream:**
+```
+[System Prompt] + [User Messages] + [Assistant: <thinking>complete_reasoning</thinking>]
+→ Claude Stream
+→ Multiple delta events with response chunks
+```
+
+**Output Stream:**
+```
+start → <thinking> → reasoning deltas... → </thinking> →
+response deltas... → usage → done
+```
+
+### Key Differences from Non-Streaming
+
+1. **Immediate Response:** Handler returns SSE stream immediately, processing happens in background
+2. **Progressive Display:** Content is visible to user as it's generated
+3. **Real-time Feedback:** User sees DeepSeek's thinking process in real-time
+4. **Event-Based:** Uses SSE events instead of single JSON response
+5. **Async Processing:** Main handler spawns background task, doesn't block
+
+---
+
+## Authentication Pipeline
+
+**Handler:** `extract_api_tokens()` in `src/handlers.rs:49-75`
+
+**Purpose:** Extracts and validates API tokens from request headers for both DeepSeek and Anthropic services.
+
+### Data Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     INCOMING HEADERS                           │
+├────────────────────────────────────────────────────────────────┤
+│ X-DeepSeek-API-Token: "sk-deepseek-abc123..."                │
+│ X-Anthropic-API-Token: "sk-ant-api03-xyz789..."              │
+│ Content-Type: "application/json"                              │
+│ ... other headers ...                                          │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 1: EXTRACT DEEPSEEK TOKEN                        │
+│              (Line 52-61)                                      │
+├────────────────────────────────────────────────────────────────┤
+│ headers.get("X-DeepSeek-API-Token")                          │
+│                                                                │
+│ ✓ Token present → Continue                                   │
+│ ✗ Token missing → ApiError::MissingHeader                    │
+│                                                                │
+│ Validate token is valid UTF-8:                                │
+│ ✓ Valid → Convert to String                                  │
+│ ✗ Invalid → ApiError::BadRequest                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 2: EXTRACT ANTHROPIC TOKEN                       │
+│              (Line 63-72)                                      │
+├────────────────────────────────────────────────────────────────┤
+│ headers.get("X-Anthropic-API-Token")                         │
+│                                                                │
+│ ✓ Token present → Continue                                   │
+│ ✗ Token missing → ApiError::MissingHeader                    │
+│                                                                │
+│ Validate token is valid UTF-8:                                │
+│ ✓ Valid → Convert to String                                  │
+│ ✗ Invalid → ApiError::BadRequest                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 3: RETURN TOKEN TUPLE                            │
+│              (Line 74)                                         │
+├────────────────────────────────────────────────────────────────┤
+│ Ok((deepseek_token, anthropic_token))                         │
+│                                                                │
+│ Returns:                                                       │
+│   ("sk-deepseek-abc123...", "sk-ant-api03-xyz789...")        │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Error Handling
+
+**Missing DeepSeek Token:**
+```
+HTTP 400 Bad Request
+{
+  "error": "Missing required header: X-DeepSeek-API-Token"
+}
+```
+
+**Missing Anthropic Token:**
+```
+HTTP 400 Bad Request
+{
+  "error": "Missing required header: X-Anthropic-API-Token"
+}
+```
+
+**Invalid Token Format:**
+```
+HTTP 400 Bad Request
+{
+  "error": "Invalid DeepSeek API token" | "Invalid Anthropic API token"
+}
+```
+
+---
+
+## Validation Pipeline
+
+**Handler:** `validate_system_prompt()` in `src/models/request.rs:75-80`
+
+**Purpose:** Ensures system prompts are not duplicated in both root level and messages array, which would cause API errors.
+
+### Data Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     INCOMING REQUEST                           │
+├────────────────────────────────────────────────────────────────┤
+│ SCENARIO 1: System prompt in root only (VALID)               │
+│ {                                                              │
+│   "system": "You are helpful...",                            │
+│   "messages": [                                               │
+│     {"role": "user", "content": "Hello"}                     │
+│   ]                                                            │
+│ }                                                              │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         CHECK 1: SYSTEM IN MESSAGES?                          │
+├────────────────────────────────────────────────────────────────┤
+│ messages.iter().any(|msg| msg.role == Role::System)          │
+│                                                                │
+│ Result: false (no system message in messages)                │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         CHECK 2: SYSTEM IN ROOT?                              │
+├────────────────────────────────────────────────────────────────┤
+│ self.system.is_some()                                         │
+│                                                                │
+│ Result: true (system prompt in root)                         │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         VALIDATION RESULT                                      │
+├────────────────────────────────────────────────────────────────┤
+│ !(system.is_some() && system_in_messages)                    │
+│ = !(true && false)                                            │
+│ = !false                                                       │
+│ = true ✓ VALID                                                │
+└────────────────────────────────────────────────────────────────┘
+
+---
+
+┌────────────────────────────────────────────────────────────────┐
+│ SCENARIO 2: System prompt in both places (INVALID)           │
+│ {                                                              │
+│   "system": "You are helpful...",                            │
+│   "messages": [                                               │
+│     {"role": "system", "content": "You are helpful..."},     │
+│     {"role": "user", "content": "Hello"}                     │
+│   ]                                                            │
+│ }                                                              │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         CHECK 1: SYSTEM IN MESSAGES?                          │
+├────────────────────────────────────────────────────────────────┤
+│ Result: true (system message found in messages)              │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         CHECK 2: SYSTEM IN ROOT?                              │
+├────────────────────────────────────────────────────────────────┤
+│ Result: true (system prompt in root)                         │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         VALIDATION RESULT                                      │
+├────────────────────────────────────────────────────────────────┤
+│ !(system.is_some() && system_in_messages)                    │
+│ = !(true && true)                                             │
+│ = !true                                                        │
+│ = false ✗ INVALID                                             │
+│                                                                │
+│ → Returns: ApiError::InvalidSystemPrompt                     │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Validation Matrix
+
+| Root System | Messages System | Result  | Reason                    |
+|-------------|----------------|---------|---------------------------|
+| ✓ Present   | ✗ Absent       | ✓ Valid | Only in root              |
+| ✗ Absent    | ✓ Present      | ✓ Valid | Only in messages          |
+| ✗ Absent    | ✗ Absent       | ✓ Valid | Optional, can be omitted  |
+| ✓ Present   | ✓ Present      | ✗ Error | Duplicate system prompt   |
+
+---
+
+## Cost Calculation Pipeline
+
+### DeepSeek Cost Calculation
+
+**Handler:** `calculate_deepseek_cost()` in `src/handlers.rs:90-102`
+
+**Purpose:** Calculates the total cost for DeepSeek API usage based on token consumption and pricing tiers.
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                   DEEPSEEK USAGE DATA                          │
+├────────────────────────────────────────────────────────────────┤
+│ prompt_tokens: 150                                            │
+│ completion_tokens: 500                                        │
+│ reasoning_tokens: 450                                         │
+│ cached_tokens: 100                                            │
+│ total_tokens: 650                                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 1: CALCULATE CACHE HIT COST                      │
+├────────────────────────────────────────────────────────────────┤
+│ Formula:                                                       │
+│   (cached_tokens / 1,000,000) * cache_hit_price              │
+│                                                                │
+│ Calculation:                                                   │
+│   (100 / 1,000,000) * $0.14                                   │
+│ = 0.0001 * $0.14                                              │
+│ = $0.000014                                                    │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 2: CALCULATE CACHE MISS COST                     │
+├────────────────────────────────────────────────────────────────┤
+│ Formula:                                                       │
+│   ((input_tokens - cached_tokens) / 1,000,000) * miss_price  │
+│                                                                │
+│ Calculation:                                                   │
+│   ((150 - 100) / 1,000,000) * $0.55                          │
+│ = (50 / 1,000,000) * $0.55                                    │
+│ = 0.00005 * $0.55                                             │
+│ = $0.0000275                                                   │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 3: CALCULATE OUTPUT COST                         │
+├────────────────────────────────────────────────────────────────┤
+│ Formula:                                                       │
+│   (output_tokens / 1,000,000) * output_price                 │
+│                                                                │
+│ Calculation:                                                   │
+│   (500 / 1,000,000) * $2.19                                   │
+│ = 0.0005 * $2.19                                              │
+│ = $0.001095                                                    │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 4: CALCULATE TOTAL COST                          │
+├────────────────────────────────────────────────────────────────┤
+│ Total = cache_hit_cost + cache_miss_cost + output_cost       │
+│       = $0.000014 + $0.0000275 + $0.001095                   │
+│       = $0.0011365                                            │
+│                                                                │
+│ Formatted: "$0.001"                                           │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Anthropic Cost Calculation
+
+**Handler:** `calculate_anthropic_cost()` in `src/handlers.rs:118-142`
+
+**Purpose:** Calculates the total cost for Anthropic Claude API usage based on model tier and token consumption.
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                   ANTHROPIC USAGE DATA                         │
+├────────────────────────────────────────────────────────────────┤
+│ model: "claude-3-5-sonnet-20241022"                          │
+│ input_tokens: 1200                                            │
+│ output_tokens: 800                                            │
+│ cache_creation_input_tokens: 0                                │
+│ cache_read_input_tokens: 500                                  │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 1: SELECT PRICING TIER                           │
+│              (Line 126-134)                                    │
+├────────────────────────────────────────────────────────────────┤
+│ Model contains "claude-3-5-sonnet"? → Yes                    │
+│                                                                │
+│ Selected Pricing:                                             │
+│   - input_price: $3.00 per 1M tokens                         │
+│   - output_price: $15.00 per 1M tokens                       │
+│   - cache_write_price: $3.75 per 1M tokens                   │
+│   - cache_read_price: $0.30 per 1M tokens                    │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 2: CALCULATE INPUT COST                          │
+├────────────────────────────────────────────────────────────────┤
+│ (1200 / 1,000,000) * $3.00 = $0.0036                         │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 3: CALCULATE OUTPUT COST                         │
+├────────────────────────────────────────────────────────────────┤
+│ (800 / 1,000,000) * $15.00 = $0.012                          │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 4: CALCULATE CACHE WRITE COST                    │
+├────────────────────────────────────────────────────────────────┤
+│ (0 / 1,000,000) * $3.75 = $0.000                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 5: CALCULATE CACHE READ COST                     │
+├────────────────────────────────────────────────────────────────┤
+│ (500 / 1,000,000) * $0.30 = $0.00015                         │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STEP 6: CALCULATE TOTAL COST                          │
+├────────────────────────────────────────────────────────────────┤
+│ Total = input + output + cache_write + cache_read            │
+│       = $0.0036 + $0.012 + $0.000 + $0.00015                 │
+│       = $0.01575                                              │
+│                                                                │
+│ Formatted: "$0.016"                                           │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Pricing Tiers
+
+**DeepSeek Pricing** (per 1M tokens):
+- Input Cache Hit: $0.14
+- Input Cache Miss: $0.55
+- Output: $2.19
+
+**Claude 3.5 Sonnet Pricing** (per 1M tokens):
+- Input: $3.00
+- Output: $15.00
+- Cache Write: $3.75
+- Cache Read: $0.30
+
+**Claude 3.5 Haiku Pricing** (per 1M tokens):
+- Input: $0.80
+- Output: $4.00
+- Cache Write: $1.00
+- Cache Read: $0.08
+
+**Claude 3 Opus Pricing** (per 1M tokens):
+- Input: $15.00
+- Output: $75.00
+- Cache Write: $18.75
+- Cache Read: $1.50
+
+---
+
+## Error Handling Pipeline
+
+**Purpose:** Handles errors at various stages of request processing and returns appropriate HTTP error responses.
+
+### Error Flow Diagram
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     ERROR SOURCES                              │
+├────────────────────────────────────────────────────────────────┤
+│ 1. Missing API tokens                                         │
+│ 2. Invalid system prompt (duplicate)                          │
+│ 3. DeepSeek API errors                                        │
+│ 4. Anthropic API errors                                       │
+│ 5. Network errors                                             │
+│ 6. Parsing errors                                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         ERROR TYPE DETERMINATION                               │
+├────────────────────────────────────────────────────────────────┤
+│ ApiError::MissingHeader                                       │
+│   → HTTP 400 Bad Request                                      │
+│   → Body: {"error": "Missing required header: X-..."}        │
+│                                                                │
+│ ApiError::InvalidSystemPrompt                                 │
+│   → HTTP 400 Bad Request                                      │
+│   → Body: {"error": "System prompt cannot be provided..."}   │
+│                                                                │
+│ ApiError::DeepSeekError                                       │
+│   → HTTP 502 Bad Gateway                                      │
+│   → Body: {"error": "DeepSeek API error: ..."}               │
+│                                                                │
+│ ApiError::AnthropicError                                      │
+│   → HTTP 502 Bad Gateway                                      │
+│   → Body: {"error": "Anthropic API error: ..."}              │
+│                                                                │
+│ ApiError::BadRequest                                          │
+│   → HTTP 400 Bad Request                                      │
+│   → Body: {"error": "<message>"}                             │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│         STREAMING ERROR HANDLING                               │
+├────────────────────────────────────────────────────────────────┤
+│ If error occurs during streaming:                             │
+│                                                                │
+│ Event: "error"                                                │
+│ Data: {                                                        │
+│   "message": "Error description",                            │
+│   "code": 500                                                 │
+│ }                                                              │
+│                                                                │
+│ → Stream terminates                                           │
+│ → No "done" event sent                                       │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Example Error Responses
+
+**Missing Header Error:**
+```json
+{
+  "error": "Missing required header: X-DeepSeek-API-Token"
+}
+```
+
+**Duplicate System Prompt Error:**
+```json
+{
+  "error": "System prompt cannot be provided in both root and messages"
+}
+```
+
+**DeepSeek API Error:**
+```json
+{
+  "error": "DeepSeek API error: No reasoning content in response",
+  "type": "missing_content"
+}
+```
+
+**Streaming Error Event:**
+```
+event: error
+data: {"message":"DeepSeek stream error: Connection timeout","code":500}
+```
+
